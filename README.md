@@ -6,7 +6,18 @@
 
 **[English](README.md) | [Português](README.pt-PT.md)**
 
-Native standalone Linux ARM64 port of Yokoi for **Anbernic RGDS / RGDS+ Stock OS**. Version **1.4.2**.
+Native standalone Linux ARM64 port of Yokoi for **Anbernic RGDS / RGDS+ Stock OS** and **[BananaOS](https://github.com/JorreFog/BananaLinux)**. Version **1.4.2**.
+
+## BananaOS
+
+The same emulator runs on BananaOS (0.4.x) on the RG DS and RG DS Plus, as an entry on its Ports shelf, using both panels.
+
+1. Get `Yokoi_BananaOS` from this repository's **Actions** (the *BananaOS package* workflow's artifact), or build it on ARM64 Linux with `bash linux/build-banana.sh`.
+2. Copy its `roms` folder onto the card's root (the BANANA partition, or `\\<address>\banana` over file sharing).
+3. Put your own `yokoi_pack_rgds.ykp` in `roms/ports/yokoi/` (the same RGDS pack as below; packs for the stock OS work unchanged).
+4. Open **Ports > Yokoi**.
+
+No calibration is needed: the buttons are read by BananaOS's fixed key codes. F (or L3, or HOME) is Pause, and Exit in the library; L2/R2 swap screens and manufacturers as on the stock OS; the volume keys and F + volume stay BananaOS's. The log is `banana/logs/yokoi/yokoi.log` on the card. Details: [banana/README.txt](banana/README.txt) and the [Linux notes](linux/README.md#bananaos).
 
 Original emulator: [RetroValou / Yokoi](https://github.com/RetroValou/Yokoi_Game_-_Watch_emulator_3ds), base revision `f273025`. RGDS adaptation project: **Filipe Baeta**, developed with assistance from ChatGPT/Codex. This is a Linux application, not the upstream Android APK.
 

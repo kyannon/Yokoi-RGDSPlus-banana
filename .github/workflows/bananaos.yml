@@ -1,0 +1,53 @@
+name: BananaOS package
+
+# Builds Yokoi natively on ARM64, runs the headless tests (original synthetic pack, SDL dummy drivers) and uploads
+# the BananaOS package: the artifact's roms/ folder goes on the card's root.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ libsdl2-dev python3-pil zip file
+
+      - name: Tests
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          python3 linux/tests/synthetic_pack.py
+          fx=/tmp/yokoi-fixtures
+          run() {
+            name=$1; shift
+            MAIN_SOURCE=linux/tests/$name.cpp OUTPUT=/tmp/yokoi-test-$name bash linux/build.sh
+            (cd "$(mktemp -d)" && timeout 300 /tmp/yokoi-test-$name "$@")
+          }
+          run banana_platform $fx/manufacturers.ykp
+          run audio_filter
+          run calibration_flow
+          run clock_watch
+          run input_volume
+          run native_setup
+          run swap_profile
+          run library_return $fx/return-list.ykp
+          run ui_flow $fx/sm510.ykp
+          run physical_start_ui $fx/sm510.ykp
+
+      - name: Package
+        run: |
+          bash linux/build-banana.sh
+          file linux/build/banana/yokoi
+          objdump -T linux/build/banana/yokoi | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yokoi_BananaOS
+          path: linux/build/banana/stage/
