@@ -63,3 +63,21 @@ Other tests cover display settings, clock, language, calibration, library return
 ## v1.4.2 input fixes
 
 TF_104 GAME A/B wiring is corrected in virtual_input.h. juggler_gate.h applies only to MB_108, observing its native MISS/Watch display and protecting both setup buttons. Tests: juggler_tropical.cpp and physical_juggler_ui.cpp. SingleGameGate remains unchanged.
+
+## BananaOS
+
+BananaOS (github.com/JorreFog/BananaLinux) has no compositor, no Wayland and no `anbernic_misc` nodes. Its emulator contract (`docs/EMULATORS.md` there) and its SDL2 2.32 patch (`buildroot/patches/sdl2/0001-banana-panels.patch`) decide how Yokoi runs. `banana/Yokoi.sh` sets `YOKOI_PLATFORM=banana`, and the frontend then:
+
+- **Display**: SDL's dummy video driver with `SDL_BANANA_PANELS=side` is one display over both panels (top on the left), whose window framebuffer BananaOS's SDL page-flips straight onto the two panels. `banana_platform.h` lays Yokoi's two 1024x768 screens into that window's halves (a viewport and scale per panel; 640x480 panels on the RG DS, 1024x768 on the Plus) and presents once per frame. A full-window clear is replaced by a fill of the panel's viewport. The software renderer gets its textures mirrored once at load instead of a flipped copy per segment (pixel-identical; also used by any software renderer elsewhere), and while a game runs with nothing over it, frames whose lit segments are unchanged are not redrawn.
+- **Buttons**: the joypad is read by kernel codes, never grabbed (bananad reads the same device): A `BTN_EAST`, B `BTN_SOUTH`, X `BTN_NORTH`, Y `BTN_WEST`, START, SELECT, L1 `BTN_TL` (TIME / previous initial), R1 next initial, L2/R2 screen swap and manufacturer. F (`BTN_MODE`, on release, unless F + volume was used for brightness), L3 and HOME (`BTN_Z`, adc-keys) are Pause / Exit. No SDL game controller, mapping or calibration is used there.
+- **Touch**: the bottom panel's touchscreen is the event device whose sysfs path contains `BANANA_TOUCH` (default `fe5e0000.i2c`), read raw as on the stock OS.
+- **Volume**: bananad owns the volume keys and the mixer. Yokoi keeps a fixed software level (`YOKOI_VOLUME`, 0..10, default 10 = gain 0.35) and shows no overlay. Audio is ALSA `default`.
+- **Lifecycle**: banana-ui has released the panels, input and sound before the launcher runs. Sleep (SIGSTOP/SIGCONT) is absorbed by the worker's existing wall-clock reset, Watch mode resyncs the clock, and SIGTERM (shutdown while playing) exits cleanly. Settings and save slots stay in the app folder.
+
+The Ports launcher darkens the bottom panel for one-panel ports (`/run/banana/panel-off`); `Yokoi.sh` turns it back on. It writes `/data/banana/logs/yokoi/yokoi.log`.
+
+Build on ARM64: `bash linux/build-banana.sh` writes `linux/build/banana/Yokoi_BananaOS_v<version>.zip` (libstdc++/libgcc static; needs only glibc and BananaOS's `/usr/lib/libSDL2-2.0.so.0`; BananaOS 0.4 uses Bootlin's 2025.08 glibc toolchain, newer than Ubuntu 24.04's glibc 2.39). `.github/workflows/bananaos.yml` builds it on `ubuntu-24.04-arm`, runs the headless tests and uploads the package.
+
+Headless checks without the panels: `YOKOI_SHARED_WINDOW=side|stack` and `YOKOI_SHARED_SIZE=WxH` give the same shared layout on plain SDL. `tests/banana_platform.cpp` checks the layout, touch mapping, pad codes and F/L3/HOME handling, and drives a full session (manufacturers, Watch, Pause, resume, F + volume, library return, exit) through the pad's key codes.
+
+Not yet confirmed on the handhelds: the build has been tested headless only (x86-64 against BananaOS's patched SDL 2.32.10, dummy video/audio). DRM presentation, the touchscreen match and audio need a first run on an RG DS / RG DS Plus.

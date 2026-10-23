@@ -15,16 +15,20 @@ public:
  explicit RgdsVolume(std::string stock="/sys/class/anbernic_misc/openbor_volume",std::string saved="volume-level.txt"):stockPath(stock),savedPath(saved){}
  ~RgdsVolume(){restore();}
  bool restore(){if(entryStock<0)return true;if(!write(stockPath,entryStock)){fprintf(stderr,"RGDS volume: could not restore entry level %d/10\n",entryStock);return false;}printf("RGDS volume: restored entry level %d/10\n",entryStock);entryStock=-1;return true;}
+ // BananaOS: bananad owns the volume keys and sets the hardware volume; Yokoi keeps one fixed software level
+ // (YOKOI_VOLUME, 0..10, default 10) and shows no volume overlay.
+ bool external=false;
+ void initExternal(int level=10){external=true;value=std::clamp(level,0,10);printf("Volume: system mixer (bananad); software level %d/10 gain=%.5f\n",value,gain());}
  void init(){int n;if(read(stockPath,n)){value=lastStock=entryStock=n;}else if(read(savedPath,n))value=n;printf("RGDS volume: %d/10 curve=0.35*(level/10)^2\n",value);}
  void change(int delta,uint64_t now){
-  if(!delta)return;
+  if(!delta||external)return;
   value=std::clamp(value+delta,0,10);visibleUntil=now+1500;
   bool saved=write(stockPath,value);if(saved)lastStock=value;
   write(savedPath,value);nextPoll=now+250;
   printf("RGDS volume: button=%d/10 gain=%.5f firmware_saved=%d\n",value,gain(),saved);
  }
  bool poll(uint64_t now){
-  if(now<nextPoll)return false;nextPoll=now+250;int n;
+  if(external||now<nextPoll)return false;nextPoll=now+250;int n;
   if(read(stockPath,n)&&n!=lastStock){lastStock=n;value=n;visibleUntil=now+1500;printf("RGDS volume: external=%d/10\n",value);return true;}return false;
  }
  int level()const{return value;}

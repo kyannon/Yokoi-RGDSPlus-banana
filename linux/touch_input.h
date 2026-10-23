@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 struct Gesture {int swipe=0;bool tap=false,doubled=false;float x=0,y=0;int panel=1;};
 class TouchGesture {
  bool held=false;float sx=0,sy=0,lastX=0,lastY=0;uint64_t start=0,lastTap=0;
@@ -26,9 +27,14 @@ class RawTouch {
 public:
  ~RawTouch(){if(fd>=0)close(fd);}
  bool available()const{return fd>=0;}
- void openDevice(){glob_t paths{};if(glob("/dev/input/event*",0,nullptr,&paths)){globfree(&paths);return;}
-  for(size_t i=0;i<paths.gl_pathc;i++){int f=open(paths.gl_pathv[i],O_RDONLY|O_NONBLOCK|O_CLOEXEC);if(f<0)continue;char name[256]{};ioctl(f,EVIOCGNAME(sizeof name),name);
-   if(strstr(name,"gt9xx")&&ioctl(f,EVIOCGABS(ABS_MT_POSITION_X),&ax)==0&&ioctl(f,EVIOCGABS(ABS_MT_POSITION_Y),&ay)==0){fd=f;printf("RGDS touch: %s (%s), %d..%d x %d..%d\n",paths.gl_pathv[i],name,ax.minimum,ax.maximum,ay.minimum,ay.maximum);break;}close(f);
+ // Stock OS: the gt9xx touchscreen. sysfsMatch (BananaOS): the device whose sysfs path contains it, any name.
+ void openDevice(const char*sysfsMatch=nullptr){glob_t paths{};if(glob("/dev/input/event*",0,nullptr,&paths)){globfree(&paths);return;}
+  for(size_t i=0;i<paths.gl_pathc;i++){
+   bool wanted=true;
+   if(sysfsMatch&&*sysfsMatch){std::string node=paths.gl_pathv[i],link="/sys/class/input/"+node.substr(node.find_last_of('/')+1);char real[4096];wanted=realpath(link.c_str(),real)&&strstr(real,sysfsMatch);}
+   if(!wanted)continue;
+   int f=open(paths.gl_pathv[i],O_RDONLY|O_NONBLOCK|O_CLOEXEC);if(f<0)continue;char name[256]{};ioctl(f,EVIOCGNAME(sizeof name),name);
+   if((sysfsMatch&&*sysfsMatch?true:strstr(name,"gt9xx")!=nullptr)&&ioctl(f,EVIOCGABS(ABS_MT_POSITION_X),&ax)==0&&ioctl(f,EVIOCGABS(ABS_MT_POSITION_Y),&ay)==0&&ax.maximum>ax.minimum&&ay.maximum>ay.minimum){fd=f;printf("RGDS touch: %s (%s), %d..%d x %d..%d\n",paths.gl_pathv[i],name,ax.minimum,ax.maximum,ay.minimum,ay.maximum);break;}close(f);
   }globfree(&paths);
  }
  std::vector<Gesture>poll(uint64_t now){std::vector<Gesture>out;if(fd<0)return out;input_event e[32];ssize_t n;while((n=read(fd,e,sizeof e))>0)for(size_t i=0;i<size_t(n)/sizeof(input_event);i++){

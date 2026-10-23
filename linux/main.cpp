@@ -27,11 +27,17 @@ using menu::tr;
 #include "button_profile.h"
 #include "swap_profile.h"
 #include "emu_worker.h"
+#include "banana_platform.h"
 static volatile sig_atomic_t stopped=0;
 static void stop(int){stopped=1;}
-struct Panel {SDL_Window* w=nullptr; SDL_Renderer* r=nullptr; SDL_Texture *seg=nullptr,*bg=nullptr,*console=nullptr,*staticLayer=nullptr,*font=nullptr;int cachedScreen=-1;bool cachedCombined=false;};
+// shared: both Panels draw into one window (BananaOS: SDL_BANANA_PANELS), each in its own viewport (view), scaled from
+// Yokoi's 1024x768 layout. mirrored: a software renderer gets its textures mirrored once at load and plain copies,
+// instead of a flipped copy (a temporary surface each) for every segment of every frame.
+struct Panel {SDL_Window* w=nullptr; SDL_Renderer* r=nullptr; SDL_Texture *seg=nullptr,*bg=nullptr,*console=nullptr,*staticLayer=nullptr,*font=nullptr;int cachedScreen=-1;bool cachedCombined=false;bool shared=false,mirrored=false;SDL_Rect view{0,0,1024,768};};
 static Panel panels[2];
 static int np=0;
+static banana::Layout layout;
+static void drop(Panel& p);
 static bool swapPanels=false;
 #ifdef YOKOI_TEST_SWAPS
 static std::atomic<int> testSwapCount{0};
@@ -40,7 +46,16 @@ static void text(Panel&p,int x,int y,const std::string&s,int scale=2){ui::label(
 static void label(Panel&p,int x,int y,const std::string&s,int face=1,uint32_t color=0xeef2f5,int width=940){ui::label(p.r,p.font,x,y,s,face,color,width);}
 static void selectionRow(Panel&p,int x,int y,int w,int h,bool selected){if(selected){ui::rect(p.r,x,y,w,h,menu::selection);ui::rect(p.r,x,y,5,h,menu::highlight);}}
 static void menuHeader(Panel&p,int x,int y,int w,const std::string&title,int face=2){label(p,x,y,title,face,menu::fg,w);ui::rect(p.r,x,y+62,w,1,menu::line);}
-static void clear(Panel& p){SDL_RenderSetLogicalSize(p.r,1024,768);SDL_SetRenderDrawColor(p.r,25,27,34,255);SDL_RenderClear(p.r);}
+static void setView(Panel&p){if(!p.shared)return;SDL_RenderSetScale(p.r,1,1);SDL_RenderSetViewport(p.r,&p.view);SDL_RenderSetScale(p.r,p.view.w/1024.f,p.view.h/768.f);}
+// SDL_RenderClear clears the whole window: in a shared window, only this panel's part is filled.
+static void fillTarget(Panel&p,Uint8 r,Uint8 g,Uint8 b){SDL_SetRenderDrawColor(p.r,r,g,b,255);if(p.shared&&!SDL_GetRenderTarget(p.r)){SDL_SetRenderDrawBlendMode(p.r,SDL_BLENDMODE_NONE);SDL_Rect all{0,0,1024,768};SDL_RenderFillRect(p.r,&all);}else SDL_RenderClear(p.r);}
+static void clear(Panel& p){if(p.shared)setView(p);else SDL_RenderSetLogicalSize(p.r,1024,768);fillTarget(p,25,27,34);}
+// A shared window is shown once, after its last panel is drawn.
+static void present(Panel&p,int index){if(!p.shared||index==np-1)SDL_RenderPresent(p.r);}
+static void destroyPanels(){
+ for(int i=0;i<np;i++){drop(panels[i]);if(panels[i].font)SDL_DestroyTexture(panels[i].font);panels[i].font=nullptr;}
+ for(int i=0;i<np;i++){if(i>0&&panels[i].shared)continue;if(panels[i].r)SDL_DestroyRenderer(panels[i].r);if(panels[i].w)SDL_DestroyWindow(panels[i].w);}
+}
 static void drop(Panel& p){for(auto t:{p.seg,p.bg,p.console,p.staticLayer})if(t)SDL_DestroyTexture(t);p.seg=p.bg=p.console=p.staticLayer=nullptr;p.cachedScreen=-1;}
 static SDL_Texture* texture(Panel& p,const std::string& path,bool white=false){
  if(path.empty())return nullptr;
@@ -48,6 +63,7 @@ static SDL_Texture* texture(Panel& p,const std::string& path,bool white=false){
  unsigned w=0,h=0;std::vector<unsigned char> rgba;unsigned err=lodepng::decode(rgba,w,h,data,n);
  if(err){fprintf(stderr,"PNG %s: %s\n",path.c_str(),lodepng_error_text(err));return nullptr;}
  if(white)for(size_t i=0;i<rgba.size();i+=4)rgba[i]=rgba[i+1]=rgba[i+2]=255;
+ if(p.mirrored)for(unsigned y=0;y<h;y++){auto*row=reinterpret_cast<uint32_t*>(rgba.data()+size_t(y)*w*4);std::reverse(row,row+w);}
  auto t=SDL_CreateTexture(p.r,SDL_PIXELFORMAT_ABGR8888,SDL_TEXTUREACCESS_STATIC,w,h);
  if(t){SDL_UpdateTexture(t,nullptr,rgba.data(),w*4);SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND);}return t;
 }
@@ -56,7 +72,7 @@ static void fit(Panel&p,SDL_Texture*t,const SDL_Rect&src,float x,float y,float w
  SDL_Rect dst{int((1024-cw*z)/2+x*z),int((768-ch*z)/2+y*z),std::max(1,int(w*z)),std::max(1,int(h*z))};int tw=0,th=0;SDL_QueryTexture(t,nullptr,nullptr,&tw,&th);
  // Yokoi pack rectangles use bottom-left Y, and each source image is mirrored.
  SDL_Rect crop=src;crop.y=th-src.y-src.h;
- SDL_RenderCopyEx(p.r,t,&crop,&dst,0,nullptr,SDL_FLIP_HORIZONTAL);
+ if(p.mirrored){crop.x=tw-src.x-src.w;SDL_RenderCopy(p.r,t,&crop,&dst);}else SDL_RenderCopyEx(p.r,t,&crop,&dst,0,nullptr,SDL_FLIP_HORIZONTAL);
 }
 static void drawGame(Panel&p,const GW_rom*g,const std::vector<Segment>&segs,int screen,bool combined,int pass=0){
  if(pass==0){
@@ -73,7 +89,7 @@ static void drawGame(Panel&p,const GW_rom*g,const std::vector<Segment>&segs,int 
  }
  const auto si=g->segment_info;float w0=si[4],h0=si[5];float w1=combined?si[6]:0,h1=combined?si[7]:0;
  float cw=combined?w0+w1:si[4+2*screen],ch=combined?std::max(h0,h1):si[5+2*screen];
- if(pass==1){bool dark=(si[3]&1)!=0;SDL_SetRenderDrawColor(p.r,0,0,0,255);SDL_RenderClear(p.r);
+ if(pass==1){bool dark=(si[3]&1)!=0;fillTarget(p,0,0,0);
  float z=std::min(1024.f/cw,768.f/ch);unsigned bg=dark?0x080908:menu::backgroundColors[menu::backgroundPreset];
  ui::rect(p.r,int((1024-cw*z)/2),int((768-ch*z)/2),int(cw*z),int(ch*z),bg);
  for(int s=0;s<2;s++){if((!combined&&s!=screen)||(s==1&&!combined&&screen==0))continue;
@@ -149,7 +165,7 @@ static bool calibrateButtons(ButtonProfile&profile,SDL_GameController*ctl,RgdsIn
    selectionRow(p,28,315,968,90,true);label(p,49,337,labels[stage],2,menu::fg);
    ui::rect(p.r,40,510,944,1,menu::line);text(p,40,540,tr("A configuração fica guardada na consola.","Settings are saved on the console."));
    if(stage==8)text(p,40,655,tr("Se R não responder: manter START+SELECT para ignorar.","If R does not respond: hold START+SELECT to skip."));
-   text(p,40,600,tr("Usar os botões indicados no corpo da RGDS+.","Follow the button labels on the RGDS+."));SDL_RenderPresent(p.r);}
+   text(p,40,600,tr("Usar os botões indicados no corpo da RGDS+.","Follow the button labels on the RGDS+."));present(p,i);}
   SDL_Delay(8);
  }
  if(stopped)return false;
@@ -198,7 +214,7 @@ static bool calibrateSwap(SwapProfile&target,const ButtonProfile&profile,SDL_Gam
    selectionRow(p,28,315,968,90,true);label(p,49,337,stage?"R2":"L2",2,menu::fg);
    ui::rect(p.r,40,510,944,1,menu::line);text(p,40,540,tr("L2 / R2: trocar ecrãs durante o jogo.","L2 / R2: swap screens during gameplay."));
    text(p,40,600,tr("Soltar o botão antes do passo seguinte.","Release the button before the next step."));
-   text(p,40,655,tr("Sem resposta: manter START+SELECT para ignorar.","No response: hold START+SELECT to skip."));SDL_RenderPresent(p.r);}
+   text(p,40,655,tr("Sem resposta: manter START+SELECT para ignorar.","No response: hold START+SELECT to skip."));present(p,i);}
   SDL_Delay(8);
  }
  if(stopped)return false;
@@ -217,29 +233,50 @@ int main(int argc,char**argv){
  if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_GAMECONTROLLER|SDL_INIT_EVENTS)){fprintf(stderr,"SDL: %s\n",SDL_GetError());return 1;}
  SDL_version v;SDL_GetVersion(&v);printf("SDL %d.%d.%d video=%s displays=%d\n",v.major,v.minor,v.patch,SDL_GetCurrentVideoDriver(),SDL_GetNumVideoDisplays());
  SDL_ShowCursor(SDL_DISABLE);int displays=SDL_GetNumVideoDisplays();
+ const bool bananaOS=banana::active();
+ {SDL_Rect r{0,0,0,0};if(displays>0)SDL_GetDisplayBounds(0,&r);layout=banana::layout(SDL_GetCurrentVideoDriver(),r.w,r.h);}
+ if(layout.shared){
+  // One window over both panels: the top panel's half is Yokoi's screen 0, the bottom one's screen 1.
+  printf("Panels: one %dx%d window, %s; top %dx%d at %d,%d; bottom %dx%d at %d,%d\n",layout.windowW,layout.windowH,layout.side?"side by side":"stacked",layout.panel[0].w,layout.panel[0].h,layout.panel[0].x,layout.panel[0].y,layout.panel[1].w,layout.panel[1].h,layout.panel[1].x,layout.panel[1].y);
+  SDL_Window*w=SDL_CreateWindow("Yokoi",0,0,layout.windowW,layout.windowH,SDL_WINDOW_SHOWN);
+  SDL_Renderer*r=w?SDL_CreateRenderer(w,-1,SDL_RENDERER_SOFTWARE):nullptr;
+  if(r){SDL_RendererInfo info{};SDL_GetRendererInfo(r,&info);printf("Renderer: %s (shared window)\n",info.name);
+   for(int i=0;i<2;i++){auto&p=panels[i];p.w=w;p.r=r;p.shared=true;p.mirrored=true;p.view=layout.panel[i];np++;clear(p);}present(panels[1],1);}
+  else{fprintf(stderr,"Shared window: %s\n",SDL_GetError());if(w)SDL_DestroyWindow(w);}
+ }
  int panelCount=smoke&&getenv("YOKOI_TEST_DUAL")?2:std::min(2,displays);
- for(int i=0;i<panelCount;i++){
+ for(int i=0;i<panelCount&&!layout.shared;i++){
   Panel&p=panels[i];SDL_Rect r;SDL_GetDisplayBounds(i%displays,&r);printf("Output %d: %d,%d %dx%d\n",i,r.x,r.y,r.w,r.h);
   p.w=SDL_CreateWindow("Yokoi RGDS+",SDL_WINDOWPOS_CENTERED_DISPLAY(i%displays),SDL_WINDOWPOS_CENTERED_DISPLAY(i%displays),1024,768,SDL_WINDOW_SHOWN);
   if(!p.w)break;
   if(!smoke)SDL_SetWindowFullscreen(p.w,SDL_WINDOW_FULLSCREEN_DESKTOP);
   p.r=SDL_CreateRenderer(p.w,-1,SDL_RENDERER_ACCELERATED);if(!p.r)p.r=SDL_CreateRenderer(p.w,-1,SDL_RENDERER_SOFTWARE);
-  if(!p.r){SDL_DestroyWindow(p.w);p.w=nullptr;break;}np++;clear(p);
+  if(!p.r){SDL_DestroyWindow(p.w);p.w=nullptr;break;}
+  {SDL_RendererInfo info{};SDL_GetRendererInfo(p.r,&info);p.mirrored=(info.flags&SDL_RENDERER_SOFTWARE)!=0;}np++;clear(p);
  }
  if(!np){fprintf(stderr,"No renderer: %s\n",SDL_GetError());SDL_Quit();return 2;}
  SDL_GameController*ctl=nullptr;
- auto openController=[&](){if(ctl&&SDL_GameControllerGetAttached(ctl))return;if(ctl)SDL_GameControllerClose(ctl);ctl=nullptr;for(int i=0;i<SDL_NumJoysticks();i++){char guid[64];SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i),guid,sizeof guid);printf("Input %d: %s GUID=%s mapped=%d\n",i,SDL_JoystickNameForIndex(i),guid,SDL_IsGameController(i));if(SDL_IsGameController(i)&&!ctl)ctl=SDL_GameControllerOpen(i);}};
+ // BananaOS: the buttons by their kernel codes (no calibration, no SDL mapping); the volume keys are bananad's.
+ banana::Pad pad;
+#ifdef YOKOI_TEST_BANANA_PAD
+ pad.simulated=bananaOS;
+#endif
+ const bool useController=!(bananaOS&&(pad.simulated||pad.open()));
+ auto openController=[&](){if(!useController)return;if(ctl&&SDL_GameControllerGetAttached(ctl))return;if(ctl)SDL_GameControllerClose(ctl);ctl=nullptr;for(int i=0;i<SDL_NumJoysticks();i++){char guid[64];SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(i),guid,sizeof guid);printf("Input %d: %s GUID=%s mapped=%d\n",i,SDL_JoystickNameForIndex(i),guid,SDL_IsGameController(i));if(SDL_IsGameController(i)&&!ctl)ctl=SDL_GameControllerOpen(i);}};
  SDL_GameControllerAddMappingsFromFile("gamecontrollerdb.txt");openController();
  if(ctl){char*m=SDL_GameControllerMapping(ctl);printf("SDL mapping (setup uses calibrated raw buttons): %s\n",m?m:"");SDL_free(m);}
  menu::loadLanguage();menu::loadDisplay();
- RgdsInput raw;raw.openDevices();RgdsVolume volume;volume.init();PressLatch latch;ButtonProfile profile;RawTouch touch;touch.openDevice();TouchGesture sdlGesture;
+ RgdsInput raw;RgdsVolume volume;RawTouch touch;
+ if(bananaOS){const char*level=getenv("YOKOI_VOLUME");volume.initExternal(level?atoi(level):10);touch.openDevice(banana::touchMatch().c_str());}
+ else{raw.openDevices();volume.init();touch.openDevice();}
+ PressLatch latch;ButtonProfile profile;TouchGesture sdlGesture;
  bool mapped=ctl&&profile.load(ctl);bool specialMapped=mapped&&profile.loadSpecial(ctl);
  if(!smoke&&ctl&&(!mapped||!specialMapped)&&!calibrateButtons(profile,ctl,raw,volume)){
-  for(int i=0;i<np;i++){if(panels[i].font)SDL_DestroyTexture(panels[i].font);SDL_DestroyRenderer(panels[i].r);SDL_DestroyWindow(panels[i].w);}SDL_GameControllerClose(ctl);SDL_Quit();return 0;
+  destroyPanels();SDL_GameControllerClose(ctl);SDL_Quit();return 0;
  }
  SwapProfile swapProfile;
  if(ctl&&!swapProfile.load(ctl)&&!smoke&&!calibrateSwap(swapProfile,profile,ctl,raw,volume)){
-  for(int i=0;i<np;i++){if(panels[i].font)SDL_DestroyTexture(panels[i].font);SDL_DestroyRenderer(panels[i].r);SDL_DestroyWindow(panels[i].w);}SDL_GameControllerClose(ctl);SDL_Quit();return 0;
+  destroyPanels();SDL_GameControllerClose(ctl);SDL_Quit();return 0;
  }
  printf("Emulation=independent wall-clock thread; nominal render=60 Hz; audio=1024 frames + 40ms prefill + DC/lowpass filter\n");
  const Uint64 packStart=SDL_GetTicks64();
@@ -281,11 +318,15 @@ int main(int argc,char**argv){
  selected=menu::loadLastGame();lastPlayed=selected;
  if(smoke&&argc>3)selected=std::min(count?count-1:0,size_t(atoi(argv[3])));
  library.init(selected);if(count){selectGame();printf("Library: %s manufacturer=%d position=%zu/%zu\n",g->ref.c_str(),library.manufacturer,library.position(selected)+1,library.games.size());}if(testGame&&count)startGame();if(smoke&&!testGame&&getenv("YOKOI_TEST_ADVANCED"))advanced=true;
- bool startupReported=false;
+ bool startupReported=false;bool drawnValid=false,drawnSwap=false;std::vector<uint8_t> drawnLit;
  uint64_t frame=0,ticks=0;double next=SDL_GetPerformanceCounter()/(double)SDL_GetPerformanceFrequency();
  while(!stopped){
   uint64_t nowMs=SDL_GetTicks64();raw.poll(nowMs);raw.takePresses();auto rawKeys=raw.takeKeys();
   std::vector<Gesture>gestures=touch.poll(nowMs);SDL_Event e;bool quit=false,toggle=false,swap=false,previousLetter=false,nextLetter=false;int manufacturerDirection=0;uint32_t presses=0;
+#ifdef YOKOI_TEST_BANANA_PAD
+  YOKOI_TEST_BANANA_PAD(pad);
+#endif
+  if(pad.available()){pad.poll();presses|=pad.takePresses();auto a=pad.take();toggle|=a.toggle;previousLetter|=a.previousLetter;nextLetter|=a.nextLetter;if(a.swap){swap=true;manufacturerDirection=a.swap;}}
   for(auto key:rawKeys){if(swapProfile.key(key)){swap=true;manufacturerDirection=swapProfile.lastFired?1:-1;}if(profile.specialType=='E'&&int(key)==profile.special)toggle=true;printf("RGDS key down: %u\n",key);}
   while(SDL_PollEvent(&e)){
    if(ctl&&swapProfile.event(e,SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(ctl)))){swap=true;manufacturerDirection=swapProfile.lastFired?1:-1;}
@@ -305,16 +346,18 @@ int main(int argc,char**argv){
     if(profile.specialType=='B'&&e.jbutton.button==profile.special)toggle=true;printf("RGDS joystick down: %u\n",e.jbutton.button);
    }
    if(!touch.available()&&(e.type==SDL_FINGERDOWN||e.type==SDL_FINGERUP)){
-    if(e.type==SDL_FINGERDOWN)sdlGesture.down(e.tfinger.x,e.tfinger.y,nowMs);else{int panel=1;for(int i=0;i<np;i++)if(SDL_GetWindowID(panels[i].w)==e.tfinger.windowID)panel=i;gestures.push_back(sdlGesture.up(e.tfinger.x,e.tfinger.y,nowMs,panel));}
+    float x=e.tfinger.x,y=e.tfinger.y;int shared=banana::toPanel(layout,x,y);
+    if(e.type==SDL_FINGERDOWN)sdlGesture.down(x,y,nowMs);else{int panel=1;if(shared>=0)panel=shared;else for(int i=0;i<np;i++)if(SDL_GetWindowID(panels[i].w)==e.tfinger.windowID)panel=i;gestures.push_back(sdlGesture.up(x,y,nowMs,panel));}
    }
    if(!touch.available()&&(e.type==SDL_MOUSEBUTTONDOWN||e.type==SDL_MOUSEBUTTONUP)&&e.button.which!=SDL_TOUCH_MOUSEID){
     int panel=0;for(int i=0;i<np;i++)if(SDL_GetWindowID(panels[i].w)==e.button.windowID)panel=i;
-    float x=e.button.x/1024.f,y=e.button.y/768.f;if(e.type==SDL_MOUSEBUTTONDOWN)sdlGesture.down(x,y,nowMs);else gestures.push_back(sdlGesture.up(x,y,nowMs,panel));
+    float x=e.button.x/1024.f,y=e.button.y/768.f;
+    if(layout.shared){x=e.button.x/float(layout.windowW);y=e.button.y/float(layout.windowH);panel=banana::toPanel(layout,x,y);}if(e.type==SDL_MOUSEBUTTONDOWN)sdlGesture.down(x,y,nowMs);else gestures.push_back(sdlGesture.up(x,y,nowMs,panel));
    }
   }
   if(quit)break;
   volume.poll(nowMs);volume.change(raw.volumeDelta(nowMs),nowMs);
-  latch.press(presses,nowMs);uint32_t m=latch.apply(mask(ctl,profile),nowMs),edge=m&~prev;prev=m;
+  latch.press(presses,nowMs);uint32_t m=latch.apply(mask(ctl,profile)|(pad.available()?pad.mask():0),nowMs),edge=m&~prev;prev=m;
   if(libraryWaitRelease){
    // A held Pause-menu key or queued touch must not navigate/relaunch on return.
    if(!m)libraryWaitRelease=false;
@@ -417,13 +460,22 @@ int main(int argc,char**argv){
 #endif
   if(ticks%4==0){
    if(playing&&!paused)worker.snapshot(segs);
-   for(int i=0;i<np;i++){
+   // A shared window is drawn in software: while a game runs with nothing over it, a frame whose lit segments and
+   // screen order are those already on the panels is not drawn again (the panels keep showing it).
+   bool redraw=true;
+   if(layout.shared&&!smoke){
+    bool plain=playing&&!paused&&!confirmation&&nowMs>=toastUntil&&!(!volume.external&&nowMs<volume.visibleUntil);
+    std::vector<uint8_t> lit(segs.size());for(size_t n=0;n<segs.size();n++)lit[n]=segs[n].buffer_state;
+    redraw=!(plain&&drawnValid&&lit==drawnLit&&swapPanels==drawnSwap);
+    drawnValid=plain;if(plain){drawnLit.swap(lit);drawnSwap=swapPanels;}
+   }
+   for(int i=0;i<np&&redraw;i++){
     auto&p=panels[i];int role=swapPanels?1-i:i;clear(p);
     if(!loaded){label(p,40,50,"Yokoi: Game & Watch Emulator",2);label(p,40,145,tr("Falta o pack yokoi_pack_rgds.ykp","Missing yokoi_pack_rgds.ykp"));label(p,40,215,err.substr(0,65),0);}
     else if(!playing){
      if(i==0||np==1){
       label(p,30,22,"Yokoi: Game & Watch Emulator",2,menu::fg,720);
-      std::string edition="RGDS+ Edition";label(p,994-ui::width(edition,0),31,edition,0,menu::orange);
+      std::string edition=bananaOS?"BananaOS":"RGDS+ Edition";label(p,994-ui::width(edition,0),31,edition,0,menu::orange);
       ui::rect(p.r,30,82,964,1,0x363b45);
       label(p,35,98,std::string(tr("Fabricante: ","Manufacturer: "))+menu::manufacturerName(library.manufacturer)+"   L2 / R2",0,menu::muted,760);
       size_t position=library.position(selected);
@@ -437,12 +489,12 @@ int main(int argc,char**argv){
       label(p,35,607,std::string(tr("Data de lançamento: ","Release date: "))+g->date,0,menu::muted);
       int x=35;for(int n=1;n<=3;n++){std::string title="Slot "+std::to_string(n)+": ";label(p,x,641,title,0,menu::muted);x+=ui::width(title,0);bool occupied=state_store::exists(g,n);std::string status=occupied?tr("Sim","Yes"):tr("Não","No");label(p,x,641,status,0,occupied?menu::highlight:menu::muted);x+=ui::width(status,0);if(n<3){label(p,x,641,"   |   ",0,menu::muted);x+=ui::width("   |   ",0);}}
       label(p,35,690,tr("A / START: Abrir relógio   Y: Carregar estado","A / START: Open watch   Y: Load state"),0,menu::muted);
-      label(p,35,727,tr("L1/R1: Salto   X: Opções avançadas   R: Sair","L1/R1: Jump   X: Advanced options   R: Exit"),0,menu::muted);
+      label(p,35,727,bananaOS?tr("L1/R1: Salto   X: Opções avançadas   F: Sair","L1/R1: Jump   X: Advanced options   F: Exit"):tr("L1/R1: Salto   X: Opções avançadas   R: Sair","L1/R1: Jump   X: Advanced options   R: Exit"),0,menu::muted);
      }else if(g&&p.console&&g->console_info){
-      auto ci=g->console_info;SDL_Rect src{ci[2],ci[3],ci[4],ci[5]};int tw,th;SDL_QueryTexture(p.console,nullptr,nullptr,&tw,&th);src.y=th-src.y-src.h;SDL_Rect dest{0,0,1024,768};SDL_RenderCopyEx(p.r,p.console,&src,&dest,0,nullptr,SDL_FLIP_HORIZONTAL);
+      auto ci=g->console_info;SDL_Rect src{ci[2],ci[3],ci[4],ci[5]};int tw,th;SDL_QueryTexture(p.console,nullptr,nullptr,&tw,&th);src.y=th-src.y-src.h;SDL_Rect dest{0,0,1024,768};if(p.mirrored){src.x=tw-src.x-src.w;SDL_RenderCopy(p.r,p.console,&src,&dest);}else SDL_RenderCopyEx(p.r,p.console,&src,&dest,0,nullptr,SDL_FLIP_HORIZONTAL);
      }
     }else{
-     SDL_SetRenderDrawColor(p.r,0,0,0,255);SDL_RenderClear(p.r);
+     fillTarget(p,0,0,0);
      bool two=false;for(auto&s:segs)if(s.screen==1)two=true;bool horizontal=two&&(g->segment_info[3]&2);
      if(two&&!horizontal)drawGame(p,g,segs,np==1?0:role,false);
      else if(role==0||np==1)drawGame(p,g,segs,0,horizontal);
@@ -465,7 +517,7 @@ int main(int argc,char**argv){
     }
     if(advanced&&!playing&&i==0){
      clear(p);menuHeader(p,40,40,944,tr("Opções avançadas","Advanced options"));
-     std::string items[]={std::string(tr("Idioma: ","Language: "))+(menu::english?"EN":"PT")+"   PT / EN",tr("Definir botões","Configure buttons"),tr("Voltar","Back")};
+     std::string items[]={std::string(tr("Idioma: ","Language: "))+(menu::english?"EN":"PT")+"   PT / EN",useController?tr("Definir botões","Configure buttons"):tr("Botões: esquema BananaOS","Buttons: BananaOS layout"),tr("Voltar","Back")};
      for(int j=0;j<3;j++){int y=240+j*85;selectionRow(p,40,y,944,70,j==advancedSelection);label(p,65,y+17,items[j],j==advancedSelection?2:1,j==advancedSelection?menu::fg:menu::muted);}
      ui::rect(p.r,40,660,944,1,menu::line);label(p,40,685,tr("A: Confirmar     B: Voltar","A: Confirm     B: Back"),0,menu::muted);
     }
@@ -476,15 +528,15 @@ int main(int argc,char**argv){
      selectionRow(p,175,425,300,62,!confirmYes);selectionRow(p,548,425,300,62,confirmYes);
      label(p,205,438,tr("Cancelar","Cancel"),!confirmYes?2:1,!confirmYes?menu::fg:menu::muted);label(p,580,438,confirmation==1?tr("Sair","Exit"):tr("Apagar","Delete"),confirmYes?2:1,confirmYes?menu::fg:menu::muted);
     }
-    if(nowMs<volume.visibleUntil&&(playing||i==0)){ui::rect(p.r,300,8,424,70,menu::bg,245);label(p,324,14,"Volume "+std::to_string(volume.level())+" / 10",0);for(int v=0;v<10;v++)ui::rect(p.r,324+v*37,52,31,9,v<volume.level()?menu::highlight:menu::selection);}
+    if(!volume.external&&nowMs<volume.visibleUntil&&(playing||i==0)){ui::rect(p.r,300,8,424,70,menu::bg,245);label(p,324,14,"Volume "+std::to_string(volume.level())+" / 10",0);for(int v=0;v<10;v++)ui::rect(p.r,324+v*37,52,31,9,v<volume.level()?menu::highlight:menu::selection);}
     if(nowMs<toastUntil&&(playing||i==0)){ui::rect(p.r,60,8,904,53,menu::bg,245);label(p,80,17,toast,0,menu::fg,860);}
-    if(smoke&&((testGame&&frame==240)||(!testGame&&frame==1))){auto*surface=SDL_CreateRGBSurfaceWithFormat(0,1024,768,32,SDL_PIXELFORMAT_ARGB8888);if(surface){SDL_RenderReadPixels(p.r,nullptr,surface->format->format,surface->pixels,surface->pitch);std::string file="/tmp/yokoi-test-"+std::to_string(i)+".bmp";SDL_SaveBMP(surface,file.c_str());SDL_FreeSurface(surface);}}
-    if(smoke&&getenv("YOKOI_TEST_RENDER_DELAY_MS"))SDL_Delay(atoi(getenv("YOKOI_TEST_RENDER_DELAY_MS")));SDL_RenderPresent(p.r);if(!startupReported&&i==np-1){printf("Startup: first frame=%llums\n",(unsigned long long)(SDL_GetTicks64()-startupStart));startupReported=true;}
+    if(smoke&&((testGame&&frame==240)||(!testGame&&frame==1))){auto*surface=SDL_CreateRGBSurfaceWithFormat(0,p.shared?p.view.w:1024,p.shared?p.view.h:768,32,SDL_PIXELFORMAT_ARGB8888);if(surface){SDL_RenderReadPixels(p.r,nullptr,surface->format->format,surface->pixels,surface->pitch);std::string file="/tmp/yokoi-test-"+std::to_string(i)+".bmp";SDL_SaveBMP(surface,file.c_str());SDL_FreeSurface(surface);}}
+    if(smoke&&getenv("YOKOI_TEST_RENDER_DELAY_MS"))SDL_Delay(atoi(getenv("YOKOI_TEST_RENDER_DELAY_MS")));present(p,i);if(!startupReported&&i==np-1){printf("Startup: first frame=%llums\n",(unsigned long long)(SDL_GetTicks64()-startupStart));startupReported=true;}
    }
    if(smoke&&++frame>=(testGame?(getenv("YOKOI_TEST_FRAMES")?atoi(getenv("YOKOI_TEST_FRAMES")):300):3))break;
   }
   ++ticks;next+=1./240;double now=SDL_GetPerformanceCounter()/(double)SDL_GetPerformanceFrequency();
   if(next>now){timespec delay{0,long((next-now)*1e9)};while(nanosleep(&delay,&delay)&&errno==EINTR&&!stopped){}}else if(now-next>.05)next=now;
  }
- silence();input.reset();cpu.reset();if(ctl)SDL_GameControllerClose(ctl);for(int i=0;i<np;i++){drop(panels[i]);if(panels[i].font)SDL_DestroyTexture(panels[i].font);SDL_DestroyRenderer(panels[i].r);SDL_DestroyWindow(panels[i].w);}gw_pack::unload();SDL_Quit();return 0;
+ silence();input.reset();cpu.reset();if(ctl)SDL_GameControllerClose(ctl);destroyPanels();gw_pack::unload();SDL_Quit();return 0;
 }
